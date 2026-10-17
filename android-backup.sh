@@ -1,7 +1,44 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: MIT
+
+## Author: Tommy Miland (@tmiland) - Copyright (c) 2026
+
+######################################################################
+####                      android-backup.sh                       ####
+####            Full-fidelity Android backup & restore            ####
+####          over ADB: app data, APKs, internal storage          ####
+####                    Maintained by @tmiland                    ####
+######################################################################
+
+#------------------------------------------------------------------------------#
 #
-# android-backup.sh — full-fidelity Android backup & restore over ADB.
+# MIT License
+#
+# Copyright (c) 2026 Tommy Miland
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#------------------------------------------------------------------------------#
+#
+# android-backup.sh — full-fidelity Android backup & restore over ADB, without
+# the deprecated `adb backup`. Rooted (Magisk/KernelSU) devices are the primary
+# target: archives are streamed from on-device `tar` over the ADB channel, and a
+# restore puts ownership (per-package uid map) and SELinux contexts back.
 #
 # Rooted device:
 #   backup : app data (/data/data + /data/user_de/0), installed APKs (/data/app),
@@ -21,7 +58,8 @@
 #           root (Magisk/KernelSU) on the device for the full path.
 #
 # This tool only reads from the device during `backup`. `restore` overwrites
-# data on the device — it asks for confirmation first.
+# data on the device — it asks for confirmation first, and `restore --dry-run`
+# validates the backup and prints the plan without writing anything at all.
 set -euo pipefail
 
 VERSION="1.0.0"
@@ -52,6 +90,7 @@ PROGRESS=1
 VERIFY=1
 NO_REBOOT=0
 NO_FORCE_STOP=0
+DRY_RUN=0             # restore --dry-run: plan only, never touches the device
 
 ROOT_KIND="none"      # none|su|adbd
 ADB=()
@@ -93,6 +132,8 @@ Common options:
   -s, --serial SERIAL   Target device (default: the only connected one)
   -y, --yes             Assume "yes" for confirmation prompts
       --no-root         Never try to use root (APK/storage-only mode)
+  -h, --help            Show this help
+      --version         Print version and exit
 
 backup options:
   -o, --out DIR         Output directory (default: ./android-backup-<serial>-<date>)
@@ -113,6 +154,7 @@ backup options:
 restore options:
   -i, --in DIR          Backup directory to restore from (required)
       --only LIST       Comma list of: data,apks,system,misc,sdcard
+      --dry-run         Validate + print the plan, then exit (writes nothing)
       --no-reboot       Do not reboot after restoring
       --no-force-stop   Do not force-stop apps before restoring data
       --no-verify       Skip checksum + post-boot verification
@@ -125,7 +167,9 @@ Examples:
   ./android-backup.sh backup --no-sdcard -o ~/phone-backup
   ./android-backup.sh restore -i android-backup-RK8LOVXGAIDMOFK7-20261016-120000
   ./android-backup.sh restore -i BACKUPDIR --only sdcard
-  ./android-backup.sh verify -i BACKUPDIR
+  ./android-backup.sh restore -i BACKUPDIR --dry-run    # safe: writes nothing
+  ./android-backup.sh verify                            # re-check what restore wrote
+  ./android-backup.sh verify -i BACKUPDIR               # ...and re-push its uid map first
 
 Full app-data fidelity requires root on the device (Magisk/KernelSU).
 Without root the backup contains APKs + internal storage only.
@@ -154,6 +198,7 @@ parse_args() {
       --include-oat) INCLUDE_OAT=1; shift ;;
       --legacy)      LEGACY=1; shift ;;
       --force)       FORCE=1; shift ;;
+      --dry-run)     DRY_RUN=1; shift ;;
       -y|--yes)      ASSUME_YES=1; shift ;;
       --no-progress) PROGRESS=0; shift ;;
       --no-verify)   VERIFY=0; shift ;;
@@ -198,7 +243,7 @@ dev_getprop() {
   { "${ADB[@]}" shell getprop "$1" 2>/dev/null || true; } | tr -d '\r'
 }
 
-detect_root() {
+detect_root() { # $1 = --read-only: never run `adb root` (used by --dry-run)
   ROOT_KIND=none
   [[ $NO_ROOT == 1 ]] && { info "root: disabled by --no-root"; return 0; }
   local u r
@@ -206,6 +251,10 @@ detect_root() {
   if [[ $u == 0 ]]; then ROOT_KIND=adbd; info "root: adbd is running as root"; return 0; fi
   if "${ADB[@]}" shell 'su -c id' 2>/dev/null | tr -d '\r' | grep -q 'uid=0'; then
     ROOT_KIND=su; info "root: su available"; return 0
+  fi
+  if [[ ${1:-} == --read-only ]]; then
+    info "root: not available (dry run — 'adb root' not attempted)"
+    return 0
   fi
   r=$("${ADB[@]}" root 2>&1 || true)
   if grep -qi 'restarting adbd as root' <<< "$r"; then
@@ -234,10 +283,13 @@ root_run() { # run a remote command string as root, text stdout
   esac
 }
 
-root_out() { # run a remote command string as root, binary stdout (adb exec-out)
+root_out() { # binary stdout from a root command (stderr separate, rc propagated)
+  # 'adb exec-out' merges the remote stderr into the stream and always returns
+  # rc 0, which hides an on-device reader failure; 'adb shell -T' keeps stderr
+  # separate and reports the real exit status (both are byte-exact).
   case $ROOT_KIND in
-    adbd) "${ADB[@]}" exec-out "$1" ;;
-    su)   "${ADB[@]}" exec-out "su -c '$1'" ;;
+    adbd) "${ADB[@]}" shell -T "$1" ;;
+    su)   "${ADB[@]}" shell -T "su -c '$1'" ;;
     none) die "root required for: $1" ;;
   esac
 }
@@ -306,12 +358,14 @@ comp() {
   esac
 }
 
-decomp() { # $1 = archive file
-  case $1 in
-    *.tar.zst) zstd -q -d -c ;;
-    *.tar.gz)  gzip -d -c ;;
-    *.tar)     cat ;;
-    *) die "unknown archive type: $1" ;;
+decomp() { # $1 = archive file -> decompressed tar on stdout
+  local f=$1
+  [[ -f $f ]] || die "no such archive: $f"
+  case $f in
+    *.tar.zst) zstd -q -d -c < "$f" ;;
+    *.tar.gz)  gzip -d -c < "$f" ;;
+    *.tar)     cat -- "$f" ;;
+    *) die "unknown archive type: $f" ;;
   esac
 }
 
@@ -404,17 +458,26 @@ create)
   kind="${2:-}"; flags="${3:-}"
   case "$kind" in
     data)
-      ex=""
-      if [ "$EXCL_OK" = 1 ]; then
-        case "$flags" in
-          *keepcache*) ;;
-          *) ex="--exclude=$REL/*/cache --exclude=$REL/*/code_cache --exclude=data/user_de/0/*/cache" ;;
-        esac
-      fi
+      # Build an explicit include list rather than handing tar the directories:
+      # toybox tar aborts the WHOLE archive on a file type it cannot store (a
+      # unix socket in app data did exactly that) and does not even name it.
+      # Restricting the list to regular files, directories and symlinks both
+      # skips those entries and lets tar survive an unreadable/vanished file.
       cd / || exit 1
-      set -- "$REL"
+      set --
+      [ -d "$REL" ] && set -- "$REL"
       [ -d /data/user_de/0 ] && set -- "$@" data/user_de/0
-      tar_cmd -cf - $ex "$@"
+      [ $# -gt 0 ] || { log "FATAL: no app-data roots found"; exit 1; }
+      list=/data/local/tmp/adbbk_list
+      case "${flags:-}" in
+        *keepcache*)
+          find "$@" \( -type f -o -type d -o -type l \) -print0 > "$list" 2>/dev/null ;;
+        *)
+          find "$@" \( -name cache -o -name code_cache \) -type d -prune -o \
+                 \( -type f -o -type d -o -type l \) -print0 > "$list" 2>/dev/null ;;
+      esac
+      [ -s "$list" ] || { log "FATAL: app-data include list is empty"; exit 1; }
+      tar_cmd --null --no-recursion -T "$list" -cf -
       ;;
     apks)
       ex=""
@@ -618,9 +681,11 @@ write_info() {
 
 verify_archive() { # $1 = file, $2 = label
   [[ $VERIFY == 1 ]] || { info "  verification skipped (--no-verify)"; return 0; }
-  local f=$1 label=$2 n sz
-  n=$(decomp "$f" | tar -tf - 2>/dev/null | wc -l | tr -d ' ' || true)
-  if [[ -z ${n:-} || $n -lt 1 ]]; then
+  local f=$1 label=$2 n sz rc=0
+  # Capture the tarball reader's own status too: a truncated tar lists some
+  # entries before failing, so a bare entry count would wrongly pass it.
+  n=$(decomp "$f" | tar -tf - 2>/dev/null | wc -l | tr -d ' ') || rc=$?
+  if [[ $rc != 0 || -z ${n:-} || $n -lt 1 ]]; then
     rm -f "$f"
     die "archive for $label is empty or corrupt — aborting"
   fi
@@ -640,16 +705,17 @@ bk_root_archive() { # $1 = kind, $2 = remote create cmd, $3 = label
   local f
   f="$OUT_DIR/$1$(ext)"
   info "backing up $label"
+  local rc=0
   if [[ $PROGRESS == 1 ]] && command -v pv >/dev/null 2>&1; then
-    if ! root_out "$rcmd" | pv -f -b -t | comp > "$f"; then
-      rm -f "$f"; die "backup of $label failed (see errors above)"
-    fi
+    root_out "$rcmd" | pv -f -b -t | comp > "$f" || rc=$?
   else
-    if ! root_out "$rcmd" | comp > "$f"; then
-      rm -f "$f"; die "backup of $label failed (see errors above)"
-    fi
+    root_out "$rcmd" | comp > "$f" || rc=$?
   fi
+  # The archive itself is the source of truth: verify_archive rejects a
+  # truncated or empty one. A non-zero rc is advisory — the on-device reader
+  # can report individual files it could not read while still finishing.
   verify_archive "$f" "$label"
+  [[ $rc == 0 ]] || warn "$label: some entries could not be read (see above); the archive itself verified"
 }
 
 bk_sdcard_nonroot() {
@@ -658,11 +724,11 @@ bk_sdcard_nonroot() {
   if "${ADB[@]}" shell "command -v tar" >/dev/null 2>&1; then
     info "backing up internal storage (/sdcard)"
     if [[ $PROGRESS == 1 ]] && command -v pv >/dev/null 2>&1; then
-      if ! "${ADB[@]}" exec-out "cd /sdcard && tar -cf - ." | pv -f -b -t | comp > "$f"; then
+      if ! "${ADB[@]}" shell -T "cd /sdcard && tar -cf - ." | pv -f -b -t | comp > "$f"; then
         rm -f "$f"; die "backup of /sdcard failed (see errors above)"
       fi
     else
-      if ! "${ADB[@]}" exec-out "cd /sdcard && tar -cf - ." | comp > "$f"; then
+      if ! "${ADB[@]}" shell -T "cd /sdcard && tar -cf - ." | comp > "$f"; then
         rm -f "$f"; die "backup of /sdcard failed (see errors above)"
       fi
     fi
@@ -832,6 +898,108 @@ check_compat() {
   fi
 }
 
+human_size() { # bytes -> human-readable (awk only, no extra dependencies)
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B KiB MiB GiB TiB", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf (i == 1 ? "%.0f %s\n" : "%.1f %s\n"), b, u[i]
+  }'
+}
+
+restore_target_for() { # $1 = kind -> where a restore would write it
+  case $1 in
+    data)      printf '/data/data + /data/user_de/0' ;;
+    apks)      printf '/data/app' ;;
+    apkdir)    printf 'APKs via adb install-multiple' ;;
+    sdcard)    printf '/data/media/0 (internal storage)' ;;
+    sdcarddir) printf '/sdcard (internal storage, adb push)' ;;
+    system)    printf 'settings, accounts, packages.xml' ;;
+    misc)      printf 'Wi-Fi / Bluetooth configs' ;;
+    *)         printf 'device' ;;
+  esac
+}
+
+# Read-only preview of a restore. Prints the plan and reports blockers. It
+# never writes to the device, never force-stops apps and never runs `adb root`
+# (so it cannot leave adbd running as root). Returns 1 if the plan has a
+# blocker, 0 otherwise.
+dry_run_restore() { # $1 = 1 when the selection needs root on the device
+  local need_root=${1:-0} e kind path bytes total=0 n=0 blockers=0 i
+  local -a steps=()
+
+  detect_root --read-only
+
+  info "dry run — nothing will be written to the device"
+  printf '\n  source : %s\n' "$IN_DIR" >&2
+  printf '  device : %s (Android SDK %s), root: %s\n' \
+    "$(dev_getprop ro.product.model)" "$(dev_getprop ro.build.version.sdk)" \
+    "$ROOT_KIND" >&2
+  printf '\n  %-8s %-30s %10s  %s\n' DOMAIN ARCHIVE SIZE TARGET >&2
+  printf '  %s\n' \
+    "---------------------------------------------------------------------------" >&2
+  for e in "${SELECTED[@]}"; do
+    kind=${e%%|*}; path=${e#*|}
+    if [[ -f $path ]]; then
+      bytes=$(stat -c %s -- "$path" 2>/dev/null || stat -f %z -- "$path" 2>/dev/null || printf 0)
+      printf '  %-8s %-30s %10s  %s\n' "$kind" "$(basename -- "$path")" \
+        "$(human_size "$bytes")" "$(restore_target_for "$kind")" >&2
+    elif [[ -d $path ]]; then
+      bytes=$(du -sk -- "$path" 2>/dev/null | cut -f1)
+      bytes=$(( ${bytes:-0} * 1024 ))
+      printf '  %-8s %-30s %10s  %s\n' "$kind" "$(basename -- "$path")/" \
+        "$(human_size "$bytes")" "$(restore_target_for "$kind")" >&2
+    else
+      warn "no such archive for '$kind' ($path) — it would be skipped"
+      continue
+    fi
+    total=$((total + bytes)); n=$((n + 1))
+  done
+  printf '  %s\n' \
+    "---------------------------------------------------------------------------" >&2
+  printf '  %s in %s item(s)\n\n' "$(human_size "$total")" "$n" >&2
+
+  if [[ $VERIFY == 1 ]]; then
+    steps+=("verify SHA256SUMS against the archives")
+  else
+    steps+=("skip checksum verification (--no-verify)")
+  fi
+  if [[ $need_root == 1 ]]; then
+    steps+=("push the on-device helper and the package->uid map")
+    [[ $NO_FORCE_STOP == 0 ]] && steps+=("force-stop running apps")
+  fi
+  for e in "${SELECTED[@]}"; do
+    kind=${e%%|*}; path=${e#*|}
+    steps+=("extract $kind from $(basename -- "$path") into $(restore_target_for "$kind")")
+  done
+  [[ $need_root == 1 ]] && steps+=("fix ownership (uid map) and SELinux contexts (restorecon)")
+  if [[ $NO_REBOOT == 0 ]]; then
+    steps+=("reboot and wait for boot to complete")
+    [[ $need_root == 1 && $VERIFY == 1 ]] && steps+=("post-boot ownership check + fixup")
+  else
+    steps+=("skip the reboot (--no-reboot)")
+  fi
+
+  info "a real restore would, in order:"
+  for (( i = 0; i < ${#steps[@]}; i++ )); do
+    printf '    %2d. %s\n' "$((i + 1))" "${steps[$i]}" >&2
+  done
+
+  if [[ $need_root == 1 && $ROOT_KIND == none ]]; then
+    warn "BLOCKER: this selection needs root (app data / APKs / system data) and no root shell is available"
+    blockers=$((blockers + 1))
+  fi
+  if [[ $LEGACY == 1 && -f $IN_DIR/legacy.ab ]]; then
+    warn "note: the legacy adb restore (legacy.ab) would also run and prompt on the device screen"
+  fi
+  printf '\n' >&2
+  if (( blockers )); then
+    warn "dry run finished with $blockers blocker(s) — a real restore would fail"
+    return 1
+  fi
+  info "dry run complete — the device was not modified"
+  return 0
+}
+
 show_plan() {
   local e kind path
   info "restore plan for $SERIAL:"
@@ -933,7 +1101,6 @@ cmd_restore() {
   [[ -n $IN_DIR ]] || die "restore requires -i DIR (the backup directory)"
   [[ -d $IN_DIR ]] || die "no such directory: $IN_DIR"
   select_device
-  detect_root
 
   collect_archives
   [[ ${#SELECTED[@]} -gt 0 ]] || die "no restorable archives found in $IN_DIR (expected appdata.tar.*, apks.tar.*, sdcard.tar.* and/or apks/)"
@@ -943,12 +1110,21 @@ cmd_restore() {
     kind=${e%%|*}
     case $kind in data|system|misc|apks) need_root=1 ;; esac
   done
+
+  check_compat
+  verify_sums
+
+  # --dry-run: preview only. detect_root --read-only never runs `adb root`, and
+  # nothing below this point is reached, so the device is left untouched.
+  if [[ $DRY_RUN == 1 ]]; then
+    if dry_run_restore "$need_root"; then exit 0; else exit 1; fi
+  fi
+
+  detect_root
   if [[ $need_root == 1 && $ROOT_KIND == none ]]; then
     die "this backup contains app data / APK / system archives, which need root on the device"
   fi
 
-  check_compat
-  verify_sums
   show_plan
   confirm "Restore the above onto this device? Existing data will be overwritten." || { info "aborted"; exit 0; }
 
@@ -991,6 +1167,7 @@ cmd_verify() {
   [[ $ROOT_KIND != none ]] || die "verify requires root on the device"
   warm_root
   push_helper
+  [[ -n $IN_DIR ]] && push_uidmap
   info "waiting for device unlock (unlock it now if it is locked)"
   local out
   if ! out=$(root_run "sh $REMOTE_PATH verify" | tr -d '\r'); then
