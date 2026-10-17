@@ -614,6 +614,24 @@ write_info() {
     done
   ) > "$OUT_DIR/SHA256SUMS" || true
 }
+
+verify_archive() { # $1 = file, $2 = label
+  [[ $VERIFY == 1 ]] || { info "  verification skipped (--no-verify)"; return 0; }
+  local f=$1 label=$2 n sz
+  n=$(decomp "$f" | tar -tf - 2>/dev/null | wc -l | tr -d ' ' || true)
+  if [[ -z ${n:-} || $n -lt 1 ]]; then
+    rm -f "$f"
+    die "archive for $label is empty or corrupt — aborting"
+  fi
+  sz=$(du -h "$f" | cut -f1)
+  info "  $label: $(basename "$f") — $sz, $n entries"
+}
+
+verify_sums() {
+  [[ $VERIFY == 1 && -f $IN_DIR/SHA256SUMS ]] || return 0
+  info "verifying archive checksums"
+  ( cd "$IN_DIR" && sha256sum -c --quiet SHA256SUMS >/dev/null ) || die "checksum mismatch — backup files are corrupt"
+}
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
