@@ -225,6 +225,69 @@ warm_root() {
   [[ $u == 0 ]] || die "root shell did not return uid 0 (got '${u:-empty}')"
 }
 
+# ------------------------------------------------------------------ adb exec
+root_run() { # run a remote command string as root, text stdout
+  case $ROOT_KIND in
+    adbd) "${ADB[@]}" shell "$1" ;;
+    su)   "${ADB[@]}" shell "su -c '$1'" ;;
+    none) die "root required for: $1" ;;
+  esac
+}
+
+root_out() { # run a remote command string as root, binary stdout (adb exec-out)
+  case $ROOT_KIND in
+    adbd) "${ADB[@]}" exec-out "$1" ;;
+    su)   "${ADB[@]}" exec-out "su -c '$1'" ;;
+    none) die "root required for: $1" ;;
+  esac
+}
+
+root_in() { # stream binary stdin to a root command string
+  case $ROOT_KIND in
+    adbd) "${ADB_STDIN[@]}" "$1" ;;
+    su)   "${ADB_STDIN[@]}" "su -c '$1'" ;;
+    none) die "root required for: $1" ;;
+  esac
+}
+
+shell_in() { # stream binary stdin to a shell command string
+  "${ADB_STDIN[@]}" "$1"
+}
+
+detect_stdin_channel() { # $1 = root|shell : pick exec-in / shell -T, verify with a binary probe
+  local mode=$1 cand=() c f probe sha_l sha_r
+  f=/data/local/tmp/adbbk_probe
+  probe="$TMPDIR_/probe.bin"
+  if "${ADB[@]}" exec-in </dev/null true >/dev/null 2>&1; then cand+=(exec-in); fi
+  cand+=(shell-T)
+  head -c 262144 /dev/urandom > "$probe"
+  sha_l=$(sha256sum "$probe" | cut -d' ' -f1)
+  for c in "${cand[@]}"; do
+    case $c in
+      exec-in) ADB_STDIN=( "${ADB[@]}" exec-in ) ;;
+      shell-T) ADB_STDIN=( "${ADB[@]}" shell -T ) ;;
+    esac
+    if [[ $mode == root ]]; then
+      if ! root_in "cat > $f" < "$probe" >/dev/null 2>&1; then
+        warn "stdin channel '$c' failed the transfer probe"; continue
+      fi
+      sha_r=$(root_run "sha256sum $f 2>/dev/null || toybox sha256sum $f 2>/dev/null || busybox sha256sum $f 2>/dev/null" | tr -d '\r' | cut -d' ' -f1)
+      root_run "rm -f $f" >/dev/null 2>&1 || true
+    else
+      if ! shell_in "cat > $f" < "$probe" >/dev/null 2>&1; then
+        warn "stdin channel '$c' failed the transfer probe"; continue
+      fi
+      sha_r=$("${ADB[@]}" shell "sha256sum $f 2>/dev/null || toybox sha256sum $f 2>/dev/null || busybox sha256sum $f 2>/dev/null" | tr -d '\r' | cut -d' ' -f1)
+      "${ADB[@]}" shell "rm -f $f" >/dev/null 2>&1 || true
+    fi
+    if [[ -n $sha_r && $sha_r == "$sha_l" ]]; then
+      info "stdin channel: $c (256 KiB round-trip verified)"
+      return 0
+    fi
+    warn "stdin channel '$c' corrupted data (local $sha_l, device $sha_r)"
+  done
+  die "no reliable binary stdin channel to the device (tried: ${cand[*]})"
+}
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
