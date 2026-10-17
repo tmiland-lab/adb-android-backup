@@ -554,6 +554,66 @@ verify)
 esac
 REMOTE_HELPER_EOF
 }
+
+push_helper() {
+  local f="$TMPDIR_/adbbk_remote.sh"
+  write_remote_helper > "$f"
+  "${ADB[@]}" push "$f" "$REMOTE_PATH" >/dev/null || die "failed to push on-device helper"
+}
+
+push_uidmap() {
+  local src=""
+  [[ -s "$IN_DIR/meta/uidmap.txt" ]] && src="$IN_DIR/meta/uidmap.txt"
+  if [[ -z $src ]]; then
+    warn "no uidmap in the backup — ownership fixup will be limited"
+    return 0
+  fi
+  "${ADB[@]}" push "$src" "$UIDMAP_PATH" >/dev/null || warn "failed to push uidmap"
+}
+
+# ------------------------------------------------------------------ metadata
+parse_uidmap() { sed -n 's/^package:\(.*\) uid:\([0-9][0-9]*\)$/\1 \2/p'; }
+
+save_meta() {
+  local d="$OUT_DIR/meta"
+  info "collecting device metadata"
+  { "${ADB[@]}" shell getprop 2>/dev/null || true; } | tr -d '\r' > "$d/getprop.txt"
+  { "${ADB[@]}" shell pm list packages -f -U 2>/dev/null || true; } | tr -d '\r' > "$d/packages.txt"
+  { "${ADB[@]}" shell pm list packages -U 2>/dev/null || true; } | tr -d '\r' | parse_uidmap > "$d/uidmap.txt"
+  { "${ADB[@]}" shell df -h /data /sdcard 2>/dev/null || true; } | tr -d '\r' > "$d/df.txt"
+  {
+    echo "tool=android-backup.sh $VERSION"
+    echo "created=$(date -Iseconds)"
+    echo "device_serial=$SERIAL"
+    echo "device_model=$(dev_getprop ro.product.model)"
+    echo "device_name=$(dev_getprop ro.product.name)"
+    echo "android_release=$(dev_getprop ro.build.version.release)"
+    echo "sdk=$(dev_getprop ro.build.version.sdk)"
+    echo "fingerprint=$(dev_getprop ro.build.fingerprint)"
+    echo "root=$ROOT_KIND"
+    echo "compressor=$COMPRESSOR"
+  } > "$d/device.txt"
+}
+
+write_info() {
+  local f="$OUT_DIR/backup-info.txt" x
+  {
+    echo "# android-backup.sh backup"
+    sed -n 's/^/ /p' "$OUT_DIR/meta/device.txt"
+    echo "contents:"
+    for x in appdata apks sdcard system misc; do
+      [[ -f "$OUT_DIR/$x$(ext)" ]] && echo "  $x$(ext)"
+    done
+    [[ -d $OUT_DIR/apks ]] && echo "  apks/ (directory of pulled APKs)"
+    [[ -f $OUT_DIR/legacy.ab ]] && echo "  legacy.ab"
+  } > "$f"
+  (
+    cd "$OUT_DIR" || exit 0
+    for x in *.tar.zst *.tar.gz *.tar legacy.ab; do
+      [[ -f $x ]] && sha256sum "$x"
+    done
+  ) > "$OUT_DIR/SHA256SUMS" || true
+}
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
