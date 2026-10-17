@@ -747,7 +747,7 @@ cmd_backup() {
     if [[ $NO_DATA == 0 ]]; then
       local dflags=""
       [[ $INCLUDE_CACHES == 1 ]] && dflags="keepcache"
-      bk_root_archive data "sh $REMOTE_PATH create data $dflags" "app data (/data/data, /data/user_de/0)"
+      bk_root_archive appdata "sh $REMOTE_PATH create data $dflags" "app data (/data/data, /data/user_de/0)"
       done_any=1
     fi
     if [[ $NO_APKS == 0 ]]; then
