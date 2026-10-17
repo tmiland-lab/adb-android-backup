@@ -527,6 +527,7 @@ verify)
     case "$line" in package:*) ;; *) continue ;; esac
     rest="${line#package:}"
     uid="${rest##*uid:}"
+    uid="${uid%%,*}"
     pkg="${rest% uid:*}"
     [ -n "$pkg" ] || continue
     case "$uid" in ""|*[!0-9]*) continue ;; esac
@@ -572,7 +573,7 @@ push_uidmap() {
 }
 
 # ------------------------------------------------------------------ metadata
-parse_uidmap() { sed -n 's/^package:\(.*\) uid:\([0-9][0-9]*\)$/\1 \2/p'; }
+parse_uidmap() { sed -n 's/^package:\(.*\) uid:\([0-9][0-9]*\).*$/\1 \2/p'; }
 
 save_meta() {
   local d="$OUT_DIR/meta"
