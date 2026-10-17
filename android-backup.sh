@@ -632,6 +632,151 @@ verify_sums() {
   info "verifying archive checksums"
   ( cd "$IN_DIR" && sha256sum -c --quiet SHA256SUMS >/dev/null ) || die "checksum mismatch — backup files are corrupt"
 }
+
+# -------------------------------------------------------------------- backup
+bk_root_archive() { # $1 = kind, $2 = remote create cmd, $3 = label
+  local kind=$1 rcmd=$2 label=$3 f="$OUT_DIR/$1$(ext)"
+  info "backing up $label"
+  if [[ $PROGRESS == 1 ]] && command -v pv >/dev/null 2>&1; then
+    if ! root_out "$rcmd" | pv -f -b -t | comp > "$f"; then
+      rm -f "$f"; die "backup of $label failed (see errors above)"
+    fi
+  else
+    if ! root_out "$rcmd" | comp > "$f"; then
+      rm -f "$f"; die "backup of $label failed (see errors above)"
+    fi
+  fi
+  verify_archive "$f" "$label"
+}
+
+bk_sdcard_nonroot() {
+  local f="$OUT_DIR/sdcard$(ext)"
+  if "${ADB[@]}" shell "command -v tar" >/dev/null 2>&1; then
+    info "backing up internal storage (/sdcard)"
+    if [[ $PROGRESS == 1 ]] && command -v pv >/dev/null 2>&1; then
+      if ! "${ADB[@]}" exec-out "cd /sdcard && tar -cf - ." | pv -f -b -t | comp > "$f"; then
+        rm -f "$f"; die "backup of /sdcard failed (see errors above)"
+      fi
+    else
+      if ! "${ADB[@]}" exec-out "cd /sdcard && tar -cf - ." | comp > "$f"; then
+        rm -f "$f"; die "backup of /sdcard failed (see errors above)"
+      fi
+    fi
+    verify_archive "$f" "internal storage"
+  else
+    warn "no tar on the device — falling back to 'adb pull' (slow)"
+    mkdir -p "$OUT_DIR/sdcard"
+    "${ADB[@]}" pull -a /sdcard/. "$OUT_DIR/sdcard/" || die "adb pull of /sdcard failed"
+    info "  pulled $(find "$OUT_DIR/sdcard" -type f 2>/dev/null | wc -l | tr -d ' ') files"
+  fi
+}
+
+pull_apks() {
+  local dest="$OUT_DIR/apks" flags=(-3) p pkg_paths f n=0 fails=0
+  [[ $ALL_APKS == 1 ]] && flags=()
+  mkdir -p "$dest"
+  info "backing up APKs (pm path + adb pull)"
+  local pkgs=()
+  mapfile -t pkgs < <({ "${ADB[@]}" shell pm list packages "${flags[@]}" 2>/dev/null || true; } | tr -d '\r' | sed -n 's/^package://p' | sort)
+  [[ ${#pkgs[@]} -gt 0 ]] || { warn "no packages found"; return 0; }
+  for p in "${pkgs[@]}"; do
+    pkg_paths=$({ "${ADB[@]}" shell pm path "$p" 2>/dev/null || true; } | tr -d '\r' | sed -n 's/^package://p')
+    if [[ -z $pkg_paths ]]; then warn "  $p: no apk path reported"; fails=$((fails+1)); continue; fi
+    mkdir -p "$dest/$p"
+    local ok=1
+    while IFS= read -r f; do
+      [[ -n $f ]] || continue
+      if ! "${ADB[@]}" pull "$f" "$dest/$p/$(basename "$f")" >/dev/null 2>&1; then
+        warn "  $p: failed to pull $(basename "$f")"; ok=0
+      fi
+    done <<< "$pkg_paths"
+    if [[ $ok == 1 ]]; then n=$((n+1)); else fails=$((fails+1)); fi
+  done
+  info "  pulled APKs for $n packages ($fails failed)"
+}
+
+bk_legacy() {
+  local sdk
+  sdk=$(dev_getprop ro.build.version.sdk)
+  if [[ ${sdk:-0} -ge 31 ]]; then
+    warn "Android SDK ${sdk}: 'adb backup' was removed/neutered in Android 12+ — this will likely produce an empty file"
+    confirm "Run legacy adb backup anyway?" || return 0
+  fi
+  info "legacy adb backup — set a password (or none) and tap 'Back up my data' on the device screen"
+  if ! "${ADB[@]}" backup -apk -shared -all -f "$OUT_DIR/legacy.ab"; then
+    warn "legacy adb backup failed"
+    return 0
+  fi
+  if [[ -s $OUT_DIR/legacy.ab ]]; then
+    info "  legacy.ab: $(du -h "$OUT_DIR/legacy.ab" | cut -f1)"
+  else
+    warn "legacy.ab is empty (device refused or app disallows backup)"
+  fi
+}
+
+cmd_backup() {
+  select_device
+  detect_root
+  local sdk model ts done_any=0
+  sdk=$(dev_getprop ro.build.version.sdk)
+  model=$(dev_getprop ro.product.model)
+  info "device: ${model:-unknown} (Android SDK ${sdk:-?}), root: $ROOT_KIND"
+
+  if [[ $ROOT_KIND == none && $NO_DATA == 0 ]]; then
+    warn "no root — app data will NOT be backed up (APKs + internal storage only)"
+    warn "  on Android <= 11 you can additionally use --legacy for adb backup"
+  fi
+
+  ts=$(date +%Y%m%d-%H%M%S)
+  OUT_DIR=${OUT_DIR:-"android-backup-${SERIAL}-${ts}"}
+  if [[ -d $OUT_DIR && $FORCE == 0 ]] && [[ -n $(ls -A "$OUT_DIR" 2>/dev/null || true) ]]; then
+    die "output directory '$OUT_DIR' is not empty (use --force to overwrite)"
+  fi
+  mkdir -p "$OUT_DIR/meta"
+  info "backup directory: $OUT_DIR"
+
+  pick_compressor
+  save_meta
+
+  if [[ $ROOT_KIND != none ]]; then
+    warm_root
+    push_helper
+    if [[ $NO_DATA == 0 ]]; then
+      local dflags=""
+      [[ $INCLUDE_CACHES == 1 ]] && dflags="keepcache"
+      bk_root_archive data "sh $REMOTE_PATH create data $dflags" "app data (/data/data, /data/user_de/0)"
+      done_any=1
+    fi
+    if [[ $NO_APKS == 0 ]]; then
+      local aflags=""
+      [[ $INCLUDE_OAT == 1 ]] && aflags="withoat"
+      bk_root_archive apks "sh $REMOTE_PATH create apks $aflags" "installed APKs (/data/app)"
+      done_any=1
+    fi
+    if [[ $NO_SDCARD == 0 ]]; then
+      bk_root_archive sdcard "sh $REMOTE_PATH create sdcard" "internal storage (/sdcard)"
+      done_any=1
+    fi
+    if [[ $NO_SYSTEM == 0 ]]; then
+      bk_root_archive system "sh $REMOTE_PATH create system" "system data (settings, accounts, packages.xml)"
+      done_any=1
+    fi
+    if [[ $WITH_MISC == 1 ]]; then
+      bk_root_archive misc "sh $REMOTE_PATH create misc" "Wi-Fi/Bluetooth configs"
+      done_any=1
+    fi
+  else
+    if [[ $NO_APKS == 0 ]]; then pull_apks; done_any=1; fi
+    if [[ $NO_SDCARD == 0 ]]; then bk_sdcard_nonroot; done_any=1; fi
+  fi
+  if [[ $LEGACY == 1 ]]; then bk_legacy; done_any=1; fi
+
+  write_info
+  [[ $done_any == 1 ]] || warn "nothing was backed up (all parts disabled?)"
+  info "backup complete: $OUT_DIR"
+  info "restore with: $PROG restore -i '$OUT_DIR'"
+}
+
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
