@@ -323,6 +323,237 @@ pick_compressor() {
   esac
   info "compressor: $COMPRESSOR"
 }
+
+# ------------------------------------------------------------------- remote
+write_remote_helper() {
+cat <<'REMOTE_HELPER_EOF'
+#!/system/bin/sh
+# adbbk_remote.sh — on-device helper for android-backup.sh. Runs as root.
+# usage: sh adbbk_remote.sh <create|extract|verify|stop-apps> [kind] [flags]
+set -u
+
+log() { echo "[device] $*" >&2; }
+ok()  { echo "ADBBK_OK"; }
+
+TAR_STYLE=tar
+if ! command -v tar >/dev/null 2>&1; then
+  if command -v toybox >/dev/null 2>&1; then TAR_STYLE=toybox; else TAR_STYLE=busybox; fi
+fi
+tar_cmd() {
+  case "$TAR_STYLE" in
+    tar) tar "$@" ;;
+    toybox) toybox tar "$@" ;;
+    busybox) busybox tar "$@" ;;
+  esac
+}
+
+RCON=restorecon
+command -v restorecon >/dev/null 2>&1 || RCON=/system/bin/restorecon
+rcon() { [ -x "$RCON" ] && "$RCON" "$@" ; return 0; }
+
+# Canonical app-data root: on modern Android /data/data is a symlink to
+# /data/user/0 (or vice versa) — tar the real directory, never the symlink.
+REL="$(readlink -f /data/data 2>/dev/null)"
+REL="${REL#/}"
+[ -n "$REL" ] || REL="data/data"
+
+EXCL_OK=1
+if ! tar_cmd -cf /dev/null --exclude=zzz /data/local/tmp/adbbk_remote.sh >/dev/null 2>&1; then
+  EXCL_OK=0
+  log "note: this tar has no --exclude support; caches will be included"
+fi
+
+chown_map() {
+  map=/data/local/tmp/adbbk_uidmap
+  [ -s "$map" ] || { log "no uidmap pushed; skipping ownership fixup"; return 0; }
+  n=0
+  while read -r pkg uid; do
+    case "$pkg" in ""|\#*) continue ;; esac
+    case "$uid" in ""|*[!0-9]*) continue ;; esac
+    for base in data/data data/user/0 data/user_de/0; do
+      d="/$base/$pkg"
+      [ -d "$d" ] || continue
+      cu="$(stat -c %u "$d" 2>/dev/null)"
+      if [ "$cu" != "$uid" ]; then
+        chown -R "$uid:$uid" "$d" 2>/dev/null && n=$((n+1))
+      fi
+    done
+  done < "$map"
+  log "ownership fixup: $n package dirs chowned"
+}
+
+ctx_data() {
+  for p in /data/data /data/user/0 /data/user_de/0; do
+    [ -e "$p" ] && rcon -RF "$p" >/dev/null 2>&1
+  done
+  return 0
+}
+
+fix_apks() {
+  [ -d /data/app ] || return 0
+  chown -R system:system /data/app 2>/dev/null
+  chmod 771 /data/app 2>/dev/null
+  find /data/app -type d -exec chmod 755 {} + 2>/dev/null
+  find /data/app -type f -exec chmod 644 {} + 2>/dev/null
+  rcon -RF /data/app >/dev/null 2>&1
+  return 0
+}
+
+case "${1:-}" in
+create)
+  kind="${2:-}"; flags="${3:-}"
+  case "$kind" in
+    data)
+      ex=""
+      if [ "$EXCL_OK" = 1 ]; then
+        case "$flags" in
+          *keepcache*) ;;
+          *) ex="--exclude=$REL/*/cache --exclude=$REL/*/code_cache --exclude=data/user_de/0/*/cache" ;;
+        esac
+      fi
+      cd / || exit 1
+      set -- "$REL"
+      [ -d /data/user_de/0 ] && set -- "$@" data/user_de/0
+      tar_cmd -cf - $ex "$@"
+      ;;
+    apks)
+      ex=""
+      if [ "$EXCL_OK" = 1 ]; then
+        case "$flags" in
+          *withoat*) ;;
+          *) ex="--exclude=data/app/*/oat --exclude=data/app/*/*/oat" ;;
+        esac
+      fi
+      cd / || exit 1
+      tar_cmd -cf - $ex data/app
+      ;;
+    sdcard)
+      cd /data/media/0 2>/dev/null || { log "FATAL: /data/media/0 not found"; exit 1; }
+      tar_cmd -cf - .
+      ;;
+    system)
+      cd / || exit 1
+      set --
+      for p in data/system/users/0 data/system_de/0 data/system/packages.xml data/system/packages.list; do
+        [ -e "/$p" ] && set -- "$@" "$p"
+      done
+      [ $# -gt 0 ] || { log "FATAL: no system paths found"; exit 1; }
+      tar_cmd -cf - "$@"
+      ;;
+    misc)
+      cd / || exit 1
+      set --
+      for p in data/misc/apexdata/com.android.wifi data/misc/wifi data/misc/bluedroid data/misc/bluetooth; do
+        [ -e "/$p" ] && set -- "$@" "$p"
+      done
+      [ $# -gt 0 ] || { log "FATAL: no wifi/bt configs found"; exit 1; }
+      tar_cmd -cf - "$@"
+      ;;
+    *) log "FATAL: unknown kind '$kind'"; exit 2 ;;
+  esac
+  rc=$?
+  if [ $rc -eq 0 ]; then log "create '$kind' finished"; else log "create '$kind' FAILED (rc=$rc)"; fi
+  exit $rc
+  ;;
+extract)
+  kind="${2:-}"
+  rc=0
+  case "$kind" in
+    data)
+      tar_cmd -xf - -C /; rc=$?
+      chown_map
+      ctx_data
+      sync
+      ;;
+    apks)
+      tar_cmd -xf - -C /; rc=$?
+      fix_apks
+      sync
+      ;;
+    sdcard)
+      mkdir -p /data/media/0
+      tar_cmd -xf - -C /data/media/0; rc=$?
+      rcon -RF /data/media >/dev/null 2>&1
+      sync
+      ;;
+    system)
+      tar_cmd -xf - -C /; rc=$?
+      chown -R system:system /data/system/users/0 /data/system_de/0 2>/dev/null
+      [ -e /data/system/packages.xml ] && chown system:system /data/system/packages.xml 2>/dev/null
+      rcon -RF /data/system/users/0 /data/system_de/0 >/dev/null 2>&1
+      [ -e /data/system/packages.xml ] && rcon /data/system/packages.xml >/dev/null 2>&1
+      sync
+      ;;
+    misc)
+      tar_cmd -xf - -C /; rc=$?
+      rcon -RF /data/misc >/dev/null 2>&1
+      sync
+      ;;
+    *) log "FATAL: unknown kind '$kind'"; exit 2 ;;
+  esac
+  echo "ADBBK_RC=$rc"
+  exit 0
+  ;;
+stop-apps)
+  am kill-all >/dev/null 2>&1
+  map=/data/local/tmp/adbbk_uidmap
+  n=0
+  if [ -s "$map" ]; then
+    while read -r pkg uid; do
+      case "$pkg" in ""|\#*) continue ;; esac
+      case "$pkg" in android|com.android.systemui) continue ;; esac
+      am force-stop "$pkg" >/dev/null 2>&1
+      n=$((n+1))
+    done < "$map"
+  fi
+  log "force-stopped $n packages"
+  ok
+  ;;
+verify)
+  i=0
+  while [ $i -lt 600 ]; do
+    if dumpsys user 2>/dev/null | grep -q RUNNING_UNLOCKED; then break; fi
+    if ls /data/data/com.android.providers.settings >/dev/null 2>&1; then break; fi
+    i=$((i+2))
+    sleep 2
+  done
+  if [ $i -ge 600 ]; then log "WARN: timed out waiting for unlock; results may be partial"; fi
+
+  live=/data/local/tmp/adbbk_live_uids
+  pm list packages -U 2>/dev/null > "$live"
+  fixed=0
+  checked=0
+  while read -r line; do
+    case "$line" in package:*) ;; *) continue ;; esac
+    rest="${line#package:}"
+    uid="${rest##*uid:}"
+    pkg="${rest% uid:*}"
+    [ -n "$pkg" ] || continue
+    case "$uid" in ""|*[!0-9]*) continue ;; esac
+    for base in data/data data/user/0 data/user_de/0; do
+      d="/$base/$pkg"
+      [ -d "$d" ] || continue
+      checked=$((checked+1))
+      cu="$(stat -c %u "$d" 2>/dev/null)"
+      if [ "$cu" != "$uid" ]; then
+        chown -R "$uid:$uid" "$d" 2>/dev/null && fixed=$((fixed+1))
+      fi
+    done
+  done < "$live"
+  ctx_data
+  rcon -RF /data/media /data/app >/dev/null 2>&1
+  sync
+  log "verify: checked $checked package dirs, fixed $fixed"
+  echo "FIXED=$fixed CHECKED=$checked"
+  ok
+  ;;
+*)
+  log "usage: sh adbbk_remote.sh create|extract|verify|stop-apps [kind] [flags]"
+  exit 2
+  ;;
+esac
+REMOTE_HELPER_EOF
+}
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
