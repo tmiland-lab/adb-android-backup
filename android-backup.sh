@@ -777,6 +777,209 @@ cmd_backup() {
   info "restore with: $PROG restore -i '$OUT_DIR'"
 }
 
+# ------------------------------------------------------------------- restore
+first_existing() {
+  local f
+  for f in "$@"; do
+    [[ -e $f ]] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+collect_archives() {
+  SELECTED=()
+  local only=$ONLY a
+  add() { # $1 kind, $2 path
+    local kind=$1 path=$2
+    [[ -n $path ]] || return 0
+    if [[ -n $only ]] && [[ ",$only," != *",$kind,"* ]]; then return 0; fi
+    SELECTED+=( "$kind|$path" )
+  }
+  a=$(first_existing "$IN_DIR/appdata.tar.zst" "$IN_DIR/appdata.tar.gz" "$IN_DIR/appdata.tar" || true)
+  add data "$a"
+  a=$(first_existing "$IN_DIR/apks.tar.zst" "$IN_DIR/apks.tar.gz" "$IN_DIR/apks.tar" || true)
+  add apks "$a"
+  a=$(first_existing "$IN_DIR/system.tar.zst" "$IN_DIR/system.tar.gz" "$IN_DIR/system.tar" || true)
+  add system "$a"
+  a=$(first_existing "$IN_DIR/misc.tar.zst" "$IN_DIR/misc.tar.gz" "$IN_DIR/misc.tar" || true)
+  add misc "$a"
+  a=$(first_existing "$IN_DIR/sdcard.tar.zst" "$IN_DIR/sdcard.tar.gz" "$IN_DIR/sdcard.tar" || true)
+  add sdcard "$a"
+  [[ -d $IN_DIR/sdcard ]] && add sdcarddir "$IN_DIR/sdcard"
+  [[ -d $IN_DIR/apks ]] && add apkdir "$IN_DIR/apks"
+  return 0
+}
+
+check_compat() {
+  local f="$IN_DIR/backup-info.txt" sdk model cur has_sys=0 e
+  [[ -f $f ]] || { warn "no backup-info.txt in $IN_DIR (unknown provenance — continuing)"; return 0; }
+  sdk=$(sed -n 's/^ *sdk=//p' "$f" | head -n1)
+  model=$(sed -n 's/^ *device_model=//p' "$f" | head -n1)
+  cur=$(dev_getprop ro.build.version.sdk)
+  if [[ -n $sdk && -n $cur && $sdk != "$cur" ]]; then
+    warn "backup was taken on Android SDK $sdk; this device is SDK $cur"
+    for e in "${SELECTED[@]}"; do [[ ${e%%|*} == system ]] && has_sys=1; done
+    if [[ $has_sys == 1 && $FORCE == 0 ]]; then
+      die "refusing to restore system data across Android versions (use --force if you really mean it)"
+    fi
+  fi
+  if [[ -n $model && $model != "$(dev_getprop ro.product.model)" ]]; then
+    warn "backup is from '$model'; this device is '$(dev_getprop ro.product.model)' — cross-device restore"
+  fi
+}
+
+show_plan() {
+  local e kind path
+  info "restore plan for $SERIAL:"
+  for e in "${SELECTED[@]}"; do
+    kind=${e%%|*}; path=${e#*|}
+    printf '    %-9s %s\n' "$kind" "$(basename "$path")" >&2
+  done
+}
+
+extract_entry() { # $1 = kind, $2 = path
+  local kind=$1 path=$2 out rc_out
+  case $kind in
+    apkdir)
+      install_apks_dir "$path"
+      return 0 ;;
+    sdcarddir)
+      info "restoring internal storage (adb push)"
+      "${ADB[@]}" push "$path/." /sdcard/ || die "push of /sdcard failed"
+      return 0 ;;
+  esac
+  info "restoring $kind from $(basename "$path")"
+  if [[ $kind == sdcard && $ROOT_KIND == none ]]; then
+    if ! out=$(decomp "$path" | shell_in "cd /sdcard && { tar -xf -; echo ADBBK_RC=\$?; }"); then
+      die "restore of $kind failed"
+    fi
+  else
+    if ! out=$(decomp "$path" | root_in "sh $REMOTE_PATH extract $kind"); then
+      die "restore of $kind failed"
+    fi
+  fi
+  rc_out=$(printf '%s\n' "$out" | sed -n 's/.*ADBBK_RC=\([0-9][0-9]*\).*/\1/p' | tail -n1)
+  if [[ -z ${rc_out:-} ]]; then
+    warn "$kind: on-device helper did not report a result — check the output above"
+  elif [[ $rc_out != 0 ]]; then
+    warn "$kind: on-device extraction reported errors (rc=$rc_out) — check the output above"
+  fi
+}
+
+install_apks_dir() {
+  local dir=$1 pkg name out ok=0 fail=0
+  local failed=() files=()
+  info "installing APKs from $dir"
+  for pkg in "$dir"/*/; do
+    pkg=${pkg%/}
+    name=$(basename "$pkg")
+    mapfile -t files < <(find "$pkg" -maxdepth 1 -name '*.apk' | sort)
+    [[ ${#files[@]} -gt 0 ]] || continue
+    if [[ ${#files[@]} -eq 1 ]]; then
+      if out=$("${ADB[@]}" install -r -d -t "${files[0]}" 2>&1); then ok=$((ok+1)); else
+        fail=$((fail+1)); failed+=("$name")
+        warn "  $name: $(printf '%s' "$out" | tail -n1 | tr -d '\r')"
+      fi
+    else
+      if out=$("${ADB[@]}" install-multiple -r -d -t "${files[@]}" 2>&1); then ok=$((ok+1)); else
+        fail=$((fail+1)); failed+=("$name")
+        warn "  $name: $(printf '%s' "$out" | tail -n1 | tr -d '\r')"
+      fi
+    fi
+  done
+  info "  installed: $ok, failed: $fail"
+  return 0
+}
+
+do_force_stop() {
+  [[ $NO_FORCE_STOP == 1 ]] && return 0
+  [[ $ROOT_KIND == none ]] && return 0
+  info "stopping apps to avoid file locks during restore"
+  root_run "sh $REMOTE_PATH stop-apps" >/dev/null 2>&1 || warn "force-stop step failed (continuing)"
+}
+
+wait_boot() {
+  local i=0
+  while (( i < 300 )); do
+    if [[ $(dev_getprop sys.boot_completed) == 1 ]]; then info "device booted"; return 0; fi
+    sleep 3; i=$((i+3))
+  done
+  warn "boot did not complete within 300s — continuing anyway"
+}
+
+stage2_verify() {
+  local out fixed
+  info "post-boot check — unlock the device now if it is locked (waiting up to 10 min)"
+  push_helper >/dev/null 2>&1 || true
+  if ! out=$(root_run "sh $REMOTE_PATH verify" | tr -d '\r'); then
+    warn "post-boot verification failed (see errors above)"
+    return 0
+  fi
+  fixed=$(printf '%s\n' "$out" | sed -n 's/.*FIXED=\([0-9][0-9]*\).*/\1/p' | tail -n1)
+  case ${fixed:-} in
+    ""|0) info "ownership/contexts verified — nothing to fix" ;;
+    *)
+      warn "fixed ownership/contexts for $fixed package dirs — rebooting once more for a clean start"
+      "${ADB[@]}" reboot >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+cmd_restore() {
+  [[ -n $IN_DIR ]] || die "restore requires -i DIR (the backup directory)"
+  [[ -d $IN_DIR ]] || die "no such directory: $IN_DIR"
+  select_device
+  detect_root
+
+  collect_archives
+  [[ ${#SELECTED[@]} -gt 0 ]] || die "no restorable archives found in $IN_DIR (expected appdata.tar.*, apks.tar.*, sdcard.tar.* and/or apks/)"
+
+  local need_root=0 e kind
+  for e in "${SELECTED[@]}"; do
+    kind=${e%%|*}
+    case $kind in data|system|misc|apks) need_root=1 ;; esac
+  done
+  if [[ $need_root == 1 && $ROOT_KIND == none ]]; then
+    die "this backup contains app data / APK / system archives, which need root on the device"
+  fi
+
+  check_compat
+  verify_sums
+  show_plan
+  confirm "Restore the above onto this device? Existing data will be overwritten." || { info "aborted"; exit 0; }
+
+  if [[ $ROOT_KIND != none ]]; then
+    warm_root
+    push_helper
+    push_uidmap
+    detect_stdin_channel root
+    do_force_stop
+  else
+    detect_stdin_channel shell
+  fi
+
+  for e in "${SELECTED[@]}"; do
+    extract_entry "${e%%|*}" "${e#*|}"
+  done
+
+  if [[ $LEGACY == 1 && -f $IN_DIR/legacy.ab ]]; then
+    warn "legacy adb restore — confirm the restore prompt on the device screen"
+    "${ADB[@]}" restore "$IN_DIR/legacy.ab" || warn "legacy adb restore failed"
+  fi
+
+  if [[ $NO_REBOOT == 0 ]]; then
+    info "rebooting device"
+    "${ADB[@]}" reboot || die "reboot failed"
+    "${ADB[@]}" wait-for-device
+    wait_boot
+    if [[ $ROOT_KIND != none && $VERIFY == 1 ]]; then stage2_verify; fi
+  else
+    info "skipped reboot (--no-reboot)"
+    info "reboot the device, then optionally run: $PROG verify -i '$IN_DIR'"
+  fi
+  info "restore finished"
+}
+
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
