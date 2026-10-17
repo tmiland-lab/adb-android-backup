@@ -139,8 +139,8 @@ on-device helper to `/data/local/tmp` when it needs one (`/data/local/tmp` is cl
 ## Install
 
 ```bash
-git clone https://github.com/tmiland/android-backup.sh.git
-cd android-backup.sh
+git clone https://github.com/tmiland-lab/adb-android-backup.git
+cd adb-android-backup
 chmod +x android-backup.sh        # already executable in the repo
 ./android-backup.sh devices
 ```
