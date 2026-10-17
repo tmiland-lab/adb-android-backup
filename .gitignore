@@ -1,0 +1,6 @@
+# Local backup output
+/android-backup-*/
+*.tar.zst
+*.tar.gz
+legacy.ab
+SHA256SUMS
