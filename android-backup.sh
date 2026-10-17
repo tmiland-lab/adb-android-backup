@@ -980,6 +980,21 @@ cmd_restore() {
   info "restore finished"
 }
 
+# -------------------------------------------------------------------- verify
+cmd_verify() {
+  select_device
+  detect_root
+  [[ $ROOT_KIND != none ]] || die "verify requires root on the device"
+  warm_root
+  push_helper
+  info "waiting for device unlock (unlock it now if it is locked)"
+  local out
+  if ! out=$(root_run "sh $REMOTE_PATH verify" | tr -d '\r'); then
+    die "verify failed"
+  fi
+  info "device reports: $(printf '%s' "$out" | tr '\n' ' ')"
+}
+
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
