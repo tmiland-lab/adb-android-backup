@@ -172,6 +172,59 @@ parse_args() {
   fi
 }
 
+# -------------------------------------------------------------------- device
+select_device() {
+  command -v "$ADB_BIN" >/dev/null 2>&1 || die "adb not found in PATH (install Android platform-tools)"
+  "$ADB_BIN" start-server >/dev/null 2>&1 || true
+  if [[ -n $SERIAL ]]; then
+    ADB=( "$ADB_BIN" -s "$SERIAL" )
+    "${ADB[@]}" get-state >/dev/null 2>&1 || die "device '$SERIAL' is not connected (see: $PROG devices)"
+    return 0
+  fi
+  local devs=() unauth
+  mapfile -t devs < <("$ADB_BIN" devices | awk 'NR>1 && $2=="device" {print $1}')
+  if [[ ${#devs[@]} -eq 0 ]]; then
+    unauth=$("$ADB_BIN" devices | awk 'NR>1 && $2=="unauthorized" {print $1}' | head -n1)
+    [[ -n $unauth ]] && die "device $unauth is unauthorized — accept the USB-debugging prompt on the device"
+    die "no device connected (see: $PROG devices)"
+  fi
+  [[ ${#devs[@]} -eq 1 ]] || die "multiple devices connected: ${devs[*]} — pick one with -s SERIAL"
+  SERIAL=${devs[0]}
+  ADB=( "$ADB_BIN" -s "$SERIAL" )
+  info "device: $SERIAL"
+}
+
+dev_getprop() {
+  { "${ADB[@]}" shell getprop "$1" 2>/dev/null || true; } | tr -d '\r'
+}
+
+detect_root() {
+  ROOT_KIND=none
+  [[ $NO_ROOT == 1 ]] && { info "root: disabled by --no-root"; return 0; }
+  local u r
+  u=$({ "${ADB[@]}" shell id -u 2>/dev/null || true; } | tr -d '\r')
+  if [[ $u == 0 ]]; then ROOT_KIND=adbd; info "root: adbd is running as root"; return 0; fi
+  if "${ADB[@]}" shell 'su -c id' 2>/dev/null | tr -d '\r' | grep -q 'uid=0'; then
+    ROOT_KIND=su; info "root: su available"; return 0
+  fi
+  r=$("${ADB[@]}" root 2>&1 || true)
+  if grep -qi 'restarting adbd as root' <<< "$r"; then
+    "${ADB[@]}" wait-for-device
+    sleep 1
+    u=$({ "${ADB[@]}" shell id -u 2>/dev/null || true; } | tr -d '\r')
+    if [[ $u == 0 ]]; then ROOT_KIND=adbd; info "root: adbd restarted as root"; return 0; fi
+  fi
+  info "root: not available"
+}
+
+warm_root() {
+  info "requesting root — approve the prompt on the device if one appears"
+  local u
+  u=$(root_run "id -u" 2>/dev/null || true)
+  u=$(printf '%s' "$u" | tr -d '\r')
+  [[ $u == 0 ]] || die "root shell did not return uid 0 (got '${u:-empty}')"
+}
+
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
