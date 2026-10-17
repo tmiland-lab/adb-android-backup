@@ -635,7 +635,9 @@ verify_sums() {
 
 # -------------------------------------------------------------------- backup
 bk_root_archive() { # $1 = kind, $2 = remote create cmd, $3 = label
-  local kind=$1 rcmd=$2 label=$3 f="$OUT_DIR/$1$(ext)"
+  local kind=$1 rcmd=$2 label=$3
+  local f
+  f="$OUT_DIR/$1$(ext)"
   info "backing up $label"
   if [[ $PROGRESS == 1 ]] && command -v pv >/dev/null 2>&1; then
     if ! root_out "$rcmd" | pv -f -b -t | comp > "$f"; then
@@ -650,7 +652,8 @@ bk_root_archive() { # $1 = kind, $2 = remote create cmd, $3 = label
 }
 
 bk_sdcard_nonroot() {
-  local f="$OUT_DIR/sdcard$(ext)"
+  local f
+  f="$OUT_DIR/sdcard$(ext)"
   if "${ADB[@]}" shell "command -v tar" >/dev/null 2>&1; then
     info "backing up internal storage (/sdcard)"
     if [[ $PROGRESS == 1 ]] && command -v pv >/dev/null 2>&1; then
