@@ -310,8 +310,11 @@ detect_stdin_channel() { # $1 = root|shell : pick exec-in / shell -T, verify wit
   local mode=$1 cand=() c f probe sha_l sha_r
   f=/data/local/tmp/adbbk_probe
   probe="$TMPDIR_/probe.bin"
-  if "${ADB[@]}" exec-in </dev/null true >/dev/null 2>&1; then cand+=(exec-in); fi
+  # 'shell -T' propagates the remote exit status and, unlike 'exec-in' (which
+  # splits argv on whitespace and never reports the remote rc), round-trips a
+  # wrapped `su -c '...'` command string intact — so it is the preferred channel.
   cand+=(shell-T)
+  if "${ADB[@]}" exec-in </dev/null true >/dev/null 2>&1; then cand+=(exec-in); fi
   head -c 262144 /dev/urandom > "$probe"
   sha_l=$(sha256sum "$probe" | cut -d' ' -f1)
   for c in "${cand[@]}"; do
@@ -323,13 +326,13 @@ detect_stdin_channel() { # $1 = root|shell : pick exec-in / shell -T, verify wit
       if ! root_in "cat > $f" < "$probe" >/dev/null 2>&1; then
         warn "stdin channel '$c' failed the transfer probe"; continue
       fi
-      sha_r=$(root_run "sha256sum $f 2>/dev/null || toybox sha256sum $f 2>/dev/null || busybox sha256sum $f 2>/dev/null" | tr -d '\r' | cut -d' ' -f1)
+      sha_r=$(root_run "sha256sum $f 2>/dev/null || toybox sha256sum $f 2>/dev/null || busybox sha256sum $f 2>/dev/null" | tr -d '\r' | cut -d' ' -f1) || true
       root_run "rm -f $f" >/dev/null 2>&1 || true
     else
       if ! shell_in "cat > $f" < "$probe" >/dev/null 2>&1; then
         warn "stdin channel '$c' failed the transfer probe"; continue
       fi
-      sha_r=$("${ADB[@]}" shell "sha256sum $f 2>/dev/null || toybox sha256sum $f 2>/dev/null || busybox sha256sum $f 2>/dev/null" | tr -d '\r' | cut -d' ' -f1)
+      sha_r=$("${ADB[@]}" shell "sha256sum $f 2>/dev/null || toybox sha256sum $f 2>/dev/null || busybox sha256sum $f 2>/dev/null" | tr -d '\r' | cut -d' ' -f1) || true
       "${ADB[@]}" shell "rm -f $f" >/dev/null 2>&1 || true
     fi
     if [[ -n $sha_r && $sha_r == "$sha_l" ]]; then
@@ -399,6 +402,29 @@ tar_cmd() {
     toybox) toybox tar "$@" ;;
     busybox) busybox tar "$@" ;;
   esac
+}
+
+# Extract stdin into $1, treating a tar exit status caused ONLY by a failed
+# utime/settime as success. On a live system some paths (GMS clearcut/, YouTube
+# app_pccache/, …) are deleted mid-extract, so restoring their mtime yields
+# "tar: settime <sec> <path>: No such file or directory" and tar exits nonzero
+# even though every file was written. Any other warning keeps the failure.
+tar_extract() { # $1 = destination directory
+  dest="$1"
+  err="/data/local/tmp/adbbk_tar.err.$$"
+  tar_cmd -xf - -C "$dest" 2>"$err"
+  trc=$?
+  if [ $trc -ne 0 ] && [ -s "$err" ]; then
+    if grep -vqE 'settime [-0-9]+ .*: |Cannot utime' "$err"; then
+      : # a genuine error is present — keep the nonzero status
+    else
+      log "extract: only benign settime warnings (tar rc=$trc treated as success)"
+      trc=0
+    fi
+    cat "$err" >&2
+  fi
+  rm -f "$err"
+  return $trc
 }
 
 RCON=restorecon
@@ -548,24 +574,24 @@ extract)
   rc=0
   case "$kind" in
     data)
-      tar_cmd -xf - -C /; rc=$?
+      tar_extract /; rc=$?
       chown_map
       ctx_data
       sync
       ;;
     apks)
-      tar_cmd -xf - -C /; rc=$?
+      tar_extract /; rc=$?
       fix_apks
       sync
       ;;
     sdcard)
       mkdir -p /data/media/0
-      tar_cmd -xf - -C /data/media/0; rc=$?
+      tar_extract /data/media/0; rc=$?
       rcon -RF /data/media >/dev/null 2>&1
       sync
       ;;
     system)
-      tar_cmd -xf - -C /; rc=$?
+      tar_extract /; rc=$?
       chown -R system:system /data/system/users/0 /data/system_de/0 2>/dev/null
       [ -e /data/system/packages.xml ] && chown system:system /data/system/packages.xml 2>/dev/null
       rcon -RF /data/system/users/0 /data/system_de/0 >/dev/null 2>&1
@@ -573,7 +599,7 @@ extract)
       sync
       ;;
     misc)
-      tar_cmd -xf - -C /; rc=$?
+      tar_extract /; rc=$?
       rcon -RF /data/misc >/dev/null 2>&1
       sync
       ;;
@@ -1047,7 +1073,7 @@ extract_entry() { # $1 = kind, $2 = path
   esac
   info "restoring $kind from $(basename "$path")"
   if [[ $kind == sdcard && $ROOT_KIND == none ]]; then
-    if ! out=$(decomp "$path" | shell_in "cd /sdcard && { tar -xf -; echo ADBBK_RC=\$?; }"); then
+    if ! out=$(decomp "$path" | shell_in "cd /sdcard && { tar -xf - 2>/data/local/tmp/adbbk_sd.err; rc=\$?; if [ \$rc -ne 0 ] && [ -s /data/local/tmp/adbbk_sd.err ]; then if grep -vqE 'settime [-0-9]+ .*: |Cannot utime' /data/local/tmp/adbbk_sd.err; then cat /data/local/tmp/adbbk_sd.err >&2; else echo '[device] only benign settime warnings' >&2; rc=0; fi; fi; rm -f /data/local/tmp/adbbk_sd.err; echo ADBBK_RC=\$rc; }"); then
       die "restore of $kind failed"
     fi
   else
