@@ -288,6 +288,41 @@ detect_stdin_channel() { # $1 = root|shell : pick exec-in / shell -T, verify wit
   done
   die "no reliable binary stdin channel to the device (tried: ${cand[*]})"
 }
+
+# --------------------------------------------------------------- compression
+ext() {
+  case $COMPRESSOR in
+    zstd) echo ".tar.zst" ;;
+    gzip) echo ".tar.gz" ;;
+    none) echo ".tar" ;;
+  esac
+}
+
+comp() {
+  case $COMPRESSOR in
+    zstd) zstd -q -T0 -3 -c ;;
+    gzip) gzip -6 -c ;;
+    none) cat ;;
+  esac
+}
+
+decomp() { # $1 = archive file
+  case $1 in
+    *.tar.zst) zstd -q -d -c ;;
+    *.tar.gz)  gzip -d -c ;;
+    *.tar)     cat ;;
+    *) die "unknown archive type: $1" ;;
+  esac
+}
+
+pick_compressor() {
+  case $COMPRESSOR in
+    auto)
+      if command -v zstd >/dev/null 2>&1; then COMPRESSOR=zstd; else COMPRESSOR=gzip; fi ;;
+    zstd) command -v zstd >/dev/null 2>&1 || die "zstd is not installed" ;;
+  esac
+  info "compressor: $COMPRESSOR"
+}
 # ---------------------------------------------------------------------- main
 main() {
   parse_args "$@"
