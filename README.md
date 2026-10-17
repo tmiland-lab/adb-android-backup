@@ -419,6 +419,7 @@ reads a live filesystem. Backup while the device is idle and it is a non-issue i
 | `adbd cannot run as root in production builds` | Expected on stock. The script uses `su` via `exec-out`/`exec-in` instead of `adb root`. |
 | `su` hangs | The Magisk/KernelSU approval dialog is on the device screen. Approve it (the script warns and waits). |
 | `tar: ...phenotype.db-wal: No such file or directory` | A live SQLite WAL/SHM disappeared mid-read. Harmless — the base DB is captured. |
+| `[device] note: tar has no --null support...` | Older toybox `tar` (Android 12 / toybox 0.8.4) lacks `--null`, so the include list is newline-separated instead of NUL-separated. Detected and handled automatically; only exotic filenames containing a newline are affected. |
 | `appdata archive is empty or corrupt — aborting` | The stream was cut mid-transfer. Check the cable/port (data-capable, direct, no hub), retry into a fresh `-o` directory. The `SHA256SUMS` manifest catches short writes on the next run. |
 | `refusing to write into non-empty output directory` | Use a fresh `-o` path or `--force`. |
 | Restored app crashes / wrong permissions | Run `./android-backup.sh verify -s SERIAL -i BACKUPDIR`, then reboot. |

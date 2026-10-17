@@ -417,6 +417,16 @@ if ! tar_cmd -cf /dev/null --exclude=zzz /data/local/tmp/adbbk_remote.sh >/dev/n
   log "note: this tar has no --exclude support; caches will be included"
 fi
 
+# --null (NUL-separated -T list) is a GNU/toybox>0.8.4 extension; Android 12's
+# toybox 0.8.4 has --no-recursion but not --null. Probe and fall back to a
+# newline-separated list when it is missing.
+NULL_OK=0
+if printf 'data/local/tmp\n' > /data/local/tmp/adbbk_probe &&
+   tar_cmd --null --no-recursion -T /data/local/tmp/adbbk_probe -cf /dev/null >/dev/null 2>&1; then
+  NULL_OK=1
+fi
+rm -f /data/local/tmp/adbbk_probe
+
 chown_map() {
   map=/data/local/tmp/adbbk_uidmap
   [ -s "$map" ] || { log "no uidmap pushed; skipping ownership fixup"; return 0; }
@@ -469,15 +479,30 @@ create)
       [ -d /data/user_de/0 ] && set -- "$@" data/user_de/0
       [ $# -gt 0 ] || { log "FATAL: no app-data roots found"; exit 1; }
       list=/data/local/tmp/adbbk_list
-      case "${flags:-}" in
-        *keepcache*)
-          find "$@" \( -type f -o -type d -o -type l \) -print0 > "$list" 2>/dev/null ;;
-        *)
-          find "$@" \( -name cache -o -name code_cache \) -type d -prune -o \
-                 \( -type f -o -type d -o -type l \) -print0 > "$list" 2>/dev/null ;;
-      esac
+      if [ "$NULL_OK" = 1 ]; then
+        case "${flags:-}" in
+          *keepcache*)
+            find "$@" \( -type f -o -type d -o -type l \) -print0 > "$list" 2>/dev/null ;;
+          *)
+            find "$@" \( -name cache -o -name code_cache \) -type d -prune -o \
+                   \( -type f -o -type d -o -type l \) -print0 > "$list" 2>/dev/null ;;
+        esac
+      else
+        log "note: tar has no --null support; using a newline-separated include list"
+        case "${flags:-}" in
+          *keepcache*)
+            find "$@" \( -type f -o -type d -o -type l \) -print > "$list" 2>/dev/null ;;
+          *)
+            find "$@" \( -name cache -o -name code_cache \) -type d -prune -o \
+                   \( -type f -o -type d -o -type l \) -print > "$list" 2>/dev/null ;;
+        esac
+      fi
       [ -s "$list" ] || { log "FATAL: app-data include list is empty"; exit 1; }
-      tar_cmd --null --no-recursion -T "$list" -cf -
+      if [ "$NULL_OK" = 1 ]; then
+        tar_cmd --null --no-recursion -T "$list" -cf -
+      else
+        tar_cmd --no-recursion -T "$list" -cf -
+      fi
       ;;
     apks)
       ex=""
