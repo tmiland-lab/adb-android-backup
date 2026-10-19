@@ -132,6 +132,8 @@ Common options:
   -s, --serial SERIAL   Target device (default: the only connected one)
   -y, --yes             Assume "yes" for confirmation prompts
       --no-root         Never try to use root (APK/storage-only mode)
+      --no-system       Skip system data (settings/accounts/packages.xml):
+                        on backup don't archive it, on restore don't write it
   -h, --help            Show this help
       --version         Print version and exit
 
@@ -140,7 +142,6 @@ backup options:
       --no-data         Skip app data
       --no-apks         Skip APK backup
       --no-sdcard       Skip internal storage (/sdcard)
-      --no-system       Skip system data (settings/accounts/packages.xml)
       --with-misc       Also back up Wi-Fi/Bluetooth configs (root)
       --all-apks        Non-root: pull system app APKs too
       --include-caches  Do not skip app cache dirs
@@ -167,6 +168,7 @@ Examples:
   ./android-backup.sh backup --no-sdcard -o ~/phone-backup
   ./android-backup.sh restore -i android-backup-RK8LOVXGAIDMOFK7-20261016-120000
   ./android-backup.sh restore -i BACKUPDIR --only sdcard
+  ./android-backup.sh restore -i BACKUPDIR --no-system  # leave settings/accounts alone
   ./android-backup.sh restore -i BACKUPDIR --dry-run    # safe: writes nothing
   ./android-backup.sh verify                            # re-check what restore wrote
   ./android-backup.sh verify -i BACKUPDIR               # ...and re-push its uid map first
@@ -920,8 +922,10 @@ collect_archives() {
   add data "$a"
   a=$(first_existing "$IN_DIR/apks.tar.zst" "$IN_DIR/apks.tar.gz" "$IN_DIR/apks.tar" || true)
   add apks "$a"
-  a=$(first_existing "$IN_DIR/system.tar.zst" "$IN_DIR/system.tar.gz" "$IN_DIR/system.tar" || true)
-  add system "$a"
+  if [[ $NO_SYSTEM == 0 ]]; then
+    a=$(first_existing "$IN_DIR/system.tar.zst" "$IN_DIR/system.tar.gz" "$IN_DIR/system.tar" || true)
+    add system "$a"
+  fi
   a=$(first_existing "$IN_DIR/misc.tar.zst" "$IN_DIR/misc.tar.gz" "$IN_DIR/misc.tar" || true)
   add misc "$a"
   a=$(first_existing "$IN_DIR/sdcard.tar.zst" "$IN_DIR/sdcard.tar.gz" "$IN_DIR/sdcard.tar" || true)

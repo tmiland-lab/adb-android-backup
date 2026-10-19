@@ -105,8 +105,8 @@ No intermediate copies on the device, no `/sdcard/android-backup.tmp` that eats 
   stick attached at the same time.
 - **Snapshot metadata** — `backup-info.txt` + `meta/` (getprop, package list, uid map, df) so you know
   exactly what a directory is three months later.
-- **Restore guards** — refuses to write system data across Android versions unless you pass `--force`;
-  warns on cross-device restores.
+- **Restore guards** — refuses to write system data across Android versions unless you pass `--force`
+  (or skip system data entirely with `--no-system`); warns on cross-device restores.
 
 ---
 
@@ -212,6 +212,7 @@ android-backup.sh <command> [options]
 |---|---|---|
 | `-i, --in DIR` | — | Backup directory to restore from (**required**). |
 | `--only LIST` | all present | Comma list of `data,apks,system,misc,sdcard`. |
+| `--no-system` | off | Skip system data — don't write settings, accounts or `packages.xml` back. Also lets a cross-SDK restore proceed without `--force`. |
 | `--dry-run` | off | Validate checksums + archives, print the plan and write targets, then exit. **Writes nothing to the device and never runs `adb root`.** |
 | `--no-reboot` | off | Don't reboot after restoring (advanced; the device's data won't be consistent until it does). |
 | `--no-force-stop` | off | Don't force-stop running apps before restoring their data. |
@@ -360,7 +361,8 @@ A restore **overwrites live data**. Read this before you run it.
 - **The device must reboot** for restored app data to be usable (uid/context re-labelling has to
   happen at mount time). `--no-reboot` exists for scripts, not for a healthy device.
 - **Restore onto the same device and same Android version.** System data (`settings` DB, `packages.xml`)
-  is version-coupled; the script refuses cross-SDK system restores unless you pass `--force`.
+  is version-coupled; the script refuses cross-SDK system restores unless you pass `--force`, and
+  `--no-system` skips system data altogether.
 - **Device-bound keys cannot be restored.** Android Keystore keys backed by the TEE (used by many
   banking, messaging and 2FA apps) never leave the device's keystore, and a backup does not contain a
   usable copy. Those apps may ask you to re-authenticate or re-enroll after a restore.
