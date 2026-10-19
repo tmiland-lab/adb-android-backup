@@ -479,12 +479,16 @@ remembered. Do not run restores unattended.
 | Device | Android | Root | Backup | Restore |
 |---|---|---|---|---|
 | Xiaomi 14T Pro (`rothko`, 2407FPN8EG) | 16 / SDK 36 | Magisk v30.7 | ✅ verified (2.6 GB app data, 8.4 GB APKs, 12 MB system) | ⚠️ dry-run verified; full restore not yet executed on hardware |
+| Xiaomi `apollo` (M2007J3SG) | 12 / SDK 31 | Magisk v26.1 | ✅ verified (3.8 GB app data, 3.8 MB system) | ✅ verified full round-trip |
 
-**Honest status note:** the backup path has been run end-to-end against a real device and its archives
-verified (`tar -t` entry counts + SHA-256). The restore path is implemented, `--dry-run`-validated, and
-syntax/lint-clean, but a *full* real restore has not yet been executed on hardware — that is the next
-validation step, and it is destructive by nature, so it needs a device you are willing to wipe. Treat
-restores as beta until that test is recorded here.
+**Honest status note:** the backup path has been run end-to-end against real devices and its archives
+verified (`tar -t` entry counts + SHA-256). A *full* real restore has been executed on hardware once
+(Xiaomi `apollo`, Android 12, Magisk v26.1): after restoring `appdata.tar.zst` + `system.tar.zst`, the
+device rebooted and an independent post-restore audit confirmed all 468 `/data/data` package
+directories present with a 1:1 set match against the archive, **zero** uid mismatches, and matching
+SHA-256 for sampled files (extract is not gated on `adb exec-out`'s exit code, so integrity is checked
+from the archives). Restore remains destructive by nature — test it on a device you are willing to wipe
+before trusting it in anger.
 
 ---
 
